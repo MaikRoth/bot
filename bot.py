@@ -42,31 +42,22 @@ server_stats = {}
 def calculate_reward(streak: int) -> int:
     return BASE_REWARD + streak * STREAK_BONUS + random.randint(0, 50)
  
-async def check_achievements(user_id: int, db):
-    # Bestehende Achievements holen
-    async with db.execute("SELECT achievement_id FROM user_achievements WHERE user_id = ?", (user_id,)) as cursor:
-        unlocked = {row[0] async for row in cursor}
-
-    # Potenzielle Checks
-    async with db.execute("SELECT coins, streak FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        user = await cursor.fetchone()
-        if not user:
-            return []
-        coins, streak = user
-
-    # Liste aller Achievements
-    async with db.execute("SELECT id, condition, reward_coins FROM achievements") as cursor:
-        all_achievements = await cursor.fetchall()
-
+async def check_achievements(user_id, coins, streak, db):
     newly_unlocked = []
 
-    for ach_id, condition, reward in all_achievements:
-        if ach_id in unlocked:
+    # Vorherige Achievements
+    async with db.execute("SELECT achievement_id FROM user_achievements WHERE user_id = ?", (user_id,)) as c:
+        already = {row[0] async for row in c}
+
+    # Alle Achievements
+    async with db.execute("SELECT id, condition, reward_coins FROM achievements") as c:
+         all_achs = await c.fetchall()
+
+    for ach_id, condition, reward_bonus in all_achs:
+        if ach_id in already:
             continue
 
         unlock = False
-
-        # === Bedingungen prüfen ===
         if condition == "daily_1" and streak >= 1:
             unlock = True
         elif condition == "daily_3" and streak >= 3:
@@ -77,13 +68,23 @@ async def check_achievements(user_id: int, db):
             unlock = True
         elif condition == "coins_10000" and coins >= 10000:
             unlock = True
+        elif condition == "buy_legendary":
+            async with db.execute(
+                "SELECT COUNT(*) FROM inventory WHERE user_id = ? AND item_rarity = 'legendary'", (user_id,)
+            ) as cur:
+                count_row = await cur.fetchone()
+                if count_row and count_row[0] > 0:
+                    unlock = True
 
         if unlock:
             await db.execute(
                 "INSERT INTO user_achievements (user_id, achievement_id) VALUES (?, ?)",
-                (user_id, ach_id)
+                (user_id, ach_id),
             )
-            await db.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (reward, user_id))
+            await db.execute(
+                        "UPDATE users SET coins = coins + ? WHERE discord_id = ?",
+                        (reward_bonus, user_id),
+                    )
             newly_unlocked.append(ach_id)
 
     await db.commit()
@@ -186,54 +187,6 @@ async def daily(interaction: discord.Interaction):
         msg = "🏆 **Neue Achievements freigeschaltet!**\n" + "\n".join(f"✨ {name}" for name in names)
         await interaction.followup.send(msg)
 
-  # --- Achievement-Check ---
-async def check_achievements(user_id, coins, streak, db):
-    newly_unlocked = []
-
-    # Vorherige Achievements
-    async with db.execute("SELECT achievement_id FROM user_achievements WHERE user_id = ?", (user_id,)) as c:
-        already = {row[0] async for row in c}
-
-    # Alle Achievements
-    async with db.execute("SELECT id, condition, reward_coins FROM achievements") as c:
-         all_achs = await c.fetchall()
-
-    for ach_id, condition, reward_bonus in all_achs:
-        if ach_id in already:
-            continue
-
-        unlock = False
-        if condition == "daily_1" and streak >= 1:
-            unlock = True
-        elif condition == "daily_3" and streak >= 3:
-            unlock = True
-        elif condition == "daily_7" and streak >= 7:
-            unlock = True
-        elif condition == "coins_1000" and coins >= 1000:
-            unlock = True
-        elif condition == "coins_10000" and coins >= 10000:
-            unlock = True
-        elif condition == "buy_legendary":
-            async with db.execute(
-                "SELECT COUNT(*) FROM inventory WHERE user_id = ? AND item_rarity = 'legendary'", (user_id,)
-            ) as cur:
-                count_row = await cur.fetchone()
-                if count_row and count_row[0] > 0:
-                    unlock = True
-
-        if unlock:
-            await db.execute(
-                "INSERT INTO user_achievements (user_id, achievement_id) VALUES (?, ?)",
-                (user_id, ach_id),
-            )
-            await db.execute(
-                        "UPDATE users SET coins = coins + ? WHERE discord_id = ?",
-                        (reward_bonus, user_id),
-                    )
-            newly_unlocked.append(ach_id)
-
-    await db.commit()
-    return newly_unlocked
 
 
 # --- Command: /gamble <amount> ---
