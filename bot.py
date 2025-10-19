@@ -199,62 +199,195 @@ async def daily(interaction: discord.Interaction):
 # --- Command: /gamble <amount> ---
 @bot.tree.command(name="gamble", description="Setze deine Münzen und versuche dein Glück!")
 @app_commands.describe(amount="Anzahl der Münzen, die du setzen möchtest")
-@commands.cooldown(1, 10, commands.BucketType.user)
+@commands.cooldown(1, 5, commands.BucketType.user)
 async def gamble(interaction: discord.Interaction, amount: int):
+    if amount <= 0:
+        return await interaction.response.send_message("❌ Bitte setze einen positiven Betrag!", ephemeral=True)
+
+    user_id = interaction.user.id
+
+    # Eine Verbindung für alles
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT coins FROM users WHERE discord_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return await interaction.response.send_message(
+                "⚠️ Du hast noch kein Profil. Nutze `/daily`, um anzufangen!", ephemeral=True
+            )
+
+        coins = row[0]
+        if coins <= 0:
+            return await interaction.response.send_message("💸 Du hast keine Münzen mehr!", ephemeral=True)
+
+        if amount > coins:
+            amount = coins  # All-in, wenn zu hoch gesetzt wird
+
+        # Zufallswurf (eine Zeile, kein unnötiger Overhead)
+        roll = random.random()
+
+        # Wahrscheinlichkeiten in Reihenfolge (logisch gruppiert)
+        if roll < 0.005:
+            multiplier, label, emoji = 50, "💎 JACKPOT!!!", "50-fache"
+        elif roll < 0.025:
+            multiplier, label, emoji = 10, "🔥 Mega Gewinn!", "10-fache"
+        elif roll < 0.125:
+            multiplier, label, emoji = 2, "🎉 Gewinn!", "Doppelte"
+        elif roll < 0.275:
+            multiplier, label, emoji = 1.5, "✨ Kleiner Gewinn!", "1,5-fache"
+        else:
+            multiplier, label, emoji = 0, "😢 Verloren!", None
+
+
+
+
+        # Münzberechnung in einer Zeile
+        winnings = amount * multiplier
+        new_coins = max(0, coins - amount + winnings)
+
+        # Direktes Update (schneller als neue Verbindung)
+        await db.execute("UPDATE users SET coins = ? WHERE discord_id = ?", (new_coins, user_id))
+        await db.commit()
+
+    # Embed schnell rendern
+    if multiplier > 0:
+        result_msg = f"{label} Du hast das **{emoji}** gewonnen! (+{winnings:,} Münzen)"
+        color = discord.Color.green()
+    else:
+        result_msg = f"{label} Du hast **{amount:,} Münzen** verloren."
+        color = discord.Color.red()
+
+    embed = discord.Embed(
+        title="🎲 Glücksspiel Ergebnis",
+        description=result_msg,
+        color=color
+    )
+    embed.add_field(name="💰 Neuer Kontostand", value=f"**{new_coins:,} Münzen**", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="autogamble", description="Gamble automatisch, bis du abbrichst oder pleite bist!")
+@app_commands.describe(
+    amount="Einsatz pro Runde",
+    update_intervalls="Update Intervall in Runden",
+    max_retries="Maximale Anzahl an Runden (0 für unendlich)"
+)
+async def autogamble(
+    interaction: discord.Interaction,
+    amount: int,
+    update_intervalls: Optional[int] = 5,
+    max_retries: Optional[int] = 0
+):
     if amount <= 0:
         await interaction.response.send_message("❌ Bitte setze einen positiven Betrag!", ephemeral=True)
         return
 
     user_id = interaction.user.id
+    await interaction.response.send_message(
+        f"🎰 **Autogamble von {interaction.user.display_name}** gestartet!\n"
+        f"Einstellungen:\n- Einsatz pro Runde: {amount}\n- Update Intervall: {update_intervalls} Runden\n"
+        f"- Max Runden: {'unbegrenzt' if max_retries == 0 else max_retries}\n`stop`, um abzubrechen.",
+        ephemeral=False
+    )
+
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute("SELECT coins FROM users WHERE discord_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
 
         if row is None:
-            await interaction.response.send_message("Du hast noch kein Profil. Nutze `/daily`, um anzufangen!", ephemeral=True)
+            await interaction.followup.send("Du hast noch kein Profil. Nutze `/daily`, um anzufangen!", ephemeral=True)
             return
 
         coins = row[0]
 
-        if amount > coins:
-            amount = coins  # Setze alles was der User hat
+    rounds = 0
+    total_win = 0
+    total_loss = 0
+    last_rounds = []
 
-        roll = random.random()  # Zahl zwischen 0.0 und 1.0
+    # --- Check-Handler für Stopp-Nachricht ---
+    def check(m):
+        return m.author.id == user_id and m.content.lower() == "stop" and m.channel == interaction.channel
 
-        if roll < 0.02:  # 2%
-            multiplier = 50
-            winnings = amount * multiplier
-            new_coins = coins + winnings
-            result_msg = f"💎 JACKPOT!!! Du hast das **50-fache** gewonnen! (+{winnings} Münzen)"
-        elif roll < 0.07:  # +5% = 7% total
-            multiplier = 10
-            winnings = amount * multiplier
-            new_coins = coins + winnings
-            result_msg = f"🔥 Krass! Du hast das **10-fache** gewonnen! (+{winnings} Münzen)"
-        elif roll < 0.27:  # +20% = 27% total
-            multiplier = 2
-            winnings = amount * multiplier
-            new_coins = coins + winnings
-            result_msg = f"🎉 Glück gehabt! Du hast das **Doppelte** gewonnen! (+{winnings} Münzen)"
-        else:  # 73%
-            new_coins = coins - amount
-            result_msg = f"😢 Leider verloren. Du hast **{amount} Münzen** verloren."
+    stop_gamble = False
 
-        # Optional: kleine Sicherheitsprüfung
-        if new_coins < 0:
-            new_coins = 0
-        
-        await db.execute("UPDATE users SET coins = ? WHERE discord_id = ?", (new_coins, user_id))
-        await db.commit()
+    async def stop_listener():
+        nonlocal stop_gamble
+        try:
+            await bot.wait_for("message", check=check)
+            stop_gamble = True
+        except asyncio.CancelledError:
+            pass
 
-    embed = discord.Embed(
-        title="🎲 Glücksspiel Ergebnis",
-        description=result_msg,
-        color=discord.Color.blue(),
-    )
-    embed.add_field(name="Neuer Kontostand", value=f"{new_coins} 💰", inline=True)
+    listener_task = asyncio.create_task(stop_listener())
 
-    await interaction.response.send_message(embed=embed)
+    try:
+        while not stop_gamble and (max_retries == 0 or rounds < max_retries):
+            rounds += 1
+            roll = random.random()
+
+            if coins < amount:
+                await interaction.followup.send(
+                    f"💸 Du hast nicht mehr genug Münzen! ({coins} übrig)\nRunden gespielt: **{rounds}**"
+                )
+                break
+
+            if roll < 0.005:  # 0,5% JACKPOT
+                multiplier = 50
+                winnings = amount * multiplier
+                coins = coins - amount + winnings
+                total_win += winnings - amount
+            elif roll < 0.025:  # 2% x10 Gewinn
+                multiplier = 10
+                winnings = amount * multiplier
+                coins = coins - amount + winnings
+                total_win += winnings - amount
+            elif roll < 0.125:  # 10% x2 Gewinn
+                multiplier = 2
+                winnings = amount * multiplier
+                coins = coins - amount + winnings
+                total_win += winnings - amount
+            elif roll < 0.275:  # 15% x1,5 Gewinn
+                multiplier = 1.5
+                winnings = int(amount * multiplier)
+                coins = coins - amount + winnings
+                total_win += winnings - amount
+            else:  # 72,5% verlieren
+                coins -= amount
+                total_loss += amount
+
+            last_rounds.append(total_win - total_loss)
+
+            # Update Datenbank
+            async with aiosqlite.connect(DATABASE) as db:
+                await db.execute("UPDATE users SET coins = ? WHERE discord_id = ?", (coins, user_id))
+                await db.commit()
+
+            # Update-Message senden
+            if rounds % update_intervalls == 0:
+                actual_profit = sum(last_rounds)
+                last_rounds = []  # Reset für nächste Intervalle
+                await interaction.followup.send(
+                    f"Autogamble von **{interaction.user.display_name}**\n🎲 Runde {rounds}: "
+                    f"💰 Gewinn: {actual_profit:+} Münzen\n💰 Kontostand: {coins}",
+                    ephemeral=False
+                )
+
+            await asyncio.sleep(0.8)
+
+        await interaction.followup.send(
+            f"🛑 **Autogamble von {interaction.user.display_name} gestoppt!**\n"
+            f"Gesamt-Runden: {rounds}\n💰 Endstand: {coins}\n📈 Gesamtgewinn: {total_win - total_loss:+}",
+            ephemeral=False
+        )
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Fehler: {e}")
+    finally:
+        listener_task.cancel()
+
+
 
 # --- Command: /profile ---
 @bot.tree.command(name="profile", description="Zeige dein Spielerprofil an")
@@ -336,7 +469,7 @@ async def achievements(interaction: discord.Interaction):
     user_id = interaction.user.id
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT id FROM users WHERE discord_id = ?", (user_id,)
+            "SELECT discord_id FROM users WHERE discord_id = ?", (user_id,)
         ) as cur:
             user = await cur.fetchone()
         if not user:
@@ -344,12 +477,18 @@ async def achievements(interaction: discord.Interaction):
             return
 
         user_db_id = user[0]
+        print( "USER:" )
+        print( user )
+        print( "USER DB ID:" )
+        print( user_db_id )
         async with db.execute(
             "SELECT a.name, a.description, ua.achieved_at FROM achievements a "
             "JOIN user_achievements ua ON a.id = ua.achievement_id "
             "WHERE ua.user_id = ?", (user_db_id,)
         ) as cur:
             achievements = await cur.fetchall()
+            print( "ACHIEVEMENTS:" )
+            print( achievements )
 
     if not achievements:
         await interaction.response.send_message("🏆 Du hast noch keine Achievements freigeschaltet.", ephemeral=True)
@@ -492,70 +631,78 @@ async def sell(interaction: discord.Interaction, item: str, quantity: int = 1):
         await db.commit()
     await interaction.response.send_message(f"✅ Du hast **{quantity}x {item}** für **{total_earnings} 💰** verkauft!")
 
-
 # --- Command: /inventory ---
-@bot.tree.command(name="inventory", description="Zeige dein Inventar")
-async def inventory(interaction: discord.Interaction):
-    user_id = interaction.user.id
+@bot.tree.command(name="inventory", description="Zeige dein Inventar oder das eines anderen Spielers an")
+@app_commands.describe(user="(Optional) Der Benutzer, dessen Inventar du sehen möchtest")
+async def inventory(interaction: discord.Interaction, user: discord.User | None = None):
+    target = user or interaction.user  
+    target_id = target.id
+    print( "TARGET ID:" )
+    print( target_id )
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT id FROM users WHERE discord_id = ?", (user_id,)
-        ) as cur:
-            user = await cur.fetchone()
-        if not user:
-            await interaction.response.send_message("Du hast noch kein Profil. Nutze `/daily` zuerst.", ephemeral=True)
+        # Nutzer-ID in DB prüfen
+        async with db.execute("SELECT id, coins FROM users WHERE discord_id = ?", (target_id,)) as cur:
+            user_row = await cur.fetchone()
+            print( "USER DB ID:" )
+            print( user_row[0] )
+        if not user_row:
+            if user:
+                await interaction.response.send_message(f"{target.display_name} hat noch kein Profil.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Du hast noch kein Profil. Nutze `/daily` zuerst.", ephemeral=True)
             return
 
-        user_db_id = user[0]
+        user_db_id, coins = user_row
+
+        # Inventar abrufen
         async with db.execute(
             "SELECT item_name, quantity, item_rarity FROM inventory WHERE user_id = ?", (user_db_id,)
         ) as cur:
             items = await cur.fetchall()
 
-        embed = discord.Embed(title=f"🎒 Inventar von {interaction.user.display_name}", color=discord.Color.purple())
-        async with db.execute(
-            "SELECT coins FROM users WHERE discord_id = ?", (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            coins = row[0] if row else 0
+    embed = discord.Embed(title=f"🎒 Inventar von {target.display_name}", color=discord.Color.purple())
+    embed.add_field(name="💰 Münzen", value=f"{coins} 💰", inline=False)
 
-        embed.add_field(name="💰 Münzen", value=f"{coins} 💰", inline=False)
-    
+    # Wenn Inventar leer
+    if not items:
+        embed.description = "Das Inventar ist leer."
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # Items nach Seltenheit sortieren
     rarity_order = {"legendary": 4, "epic": 3, "rare": 2, "uncommon": 1, "common": 0}
     items.sort(key=lambda x: rarity_order.get(x[2], 0), reverse=True)
-    if not items:
-        embed.add_field(name="📦 Inventar", value="Keine Items gefunden.", inline=False)
-    else:
-        for name, qty, rarity in items:
-            if rarity == "common":
-                color_block = f"```md\n> {rarity.capitalize()}\n```"       
-            elif rarity == "uncommon":
-                color_block = f"```yaml\n{rarity.capitalize()}\n```"     
-            elif rarity == "rare":
-                color_block = f"```fix\n{rarity.capitalize()}\n```"      
-            elif rarity == "epic":
-                color_block = f"```asciidoc\n.{rarity.capitalize()}\n```" 
-            elif rarity == "legendary":
-                color_block = f"```ml\n{rarity.capitalize()}\n```"        
-            else:
-                color_block = rarity
 
-            embed.add_field(
-                name=name,
-                value=f"Menge: {qty} {color_block}",
-                inline=True
-            )
-        # berechne wert des inventars
-        total_value = 0
-        async with aiosqlite.connect(DATABASE) as db:
-            for name, qty, rarity in items:
-                async with db.execute("SELECT price FROM shop_items WHERE LOWER(name) = LOWER(?)", (name,)) as cur:
-                    row = await cur.fetchone()
-                    if row:
-                        price = row[0]
-                        total_value += price * qty
-        embed.add_field(name="💎 Gesamtwert des Inventars", value=f"{total_value} 💰", inline=False)
-    await interaction.response.send_message(embed=embed)        
+    # Raritätsfarben-Block (visuell hübsch)
+    def rarity_block(rarity: str) -> str:
+        match rarity:
+            case "common": return "```md\n> Common\n```"
+            case "uncommon": return "```yaml\nUncommon\n```"
+            case "rare": return "```fix\nRare\n```"
+            case "epic": return "```asciidoc\n.Epic\n```"
+            case "legendary": return "```ml\nLegendary\n```"
+            case _: return rarity
+
+    for name, qty, rarity in items:
+        embed.add_field(
+            name=name,
+            value=f"Menge: {qty} {rarity_block(rarity)}",
+            inline=True
+        )
+
+    # Gesamtwert berechnen (eine DB-Verbindung reicht)
+    total_value = 0
+    async with aiosqlite.connect(DATABASE) as db:
+        for name, qty, _ in items:
+            async with db.execute("SELECT price FROM shop_items WHERE LOWER(name) = LOWER(?)", (name,)) as cur:
+                row = await cur.fetchone()
+                if row:
+                    total_value += row[0] * qty
+
+    embed.add_field(name="💎 Gesamtwert des Inventars", value=f"{total_value} 💰", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
 
 # --- Command: /leaderboard ---
 @bot.tree.command(name="leaderboard", description="Zeige die Top-Spieler")
