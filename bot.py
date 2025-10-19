@@ -332,7 +332,7 @@ async def autogamble(
                     f"💸 Du hast nicht mehr genug Münzen! ({coins} übrig)\nRunden gespielt: **{rounds}**"
                 )
                 break
-
+            winnings = 0
             if roll < 0.005:  # 0,5% JACKPOT
                 multiplier = 50
                 winnings = amount * multiplier
@@ -357,7 +357,7 @@ async def autogamble(
                 coins -= amount
                 total_loss += amount
 
-            last_rounds.append(total_win - total_loss)
+            last_rounds.append( winnings - amount if roll >= 0.275 else -amount )
 
             # Update Datenbank
             async with aiosqlite.connect(DATABASE) as db:
@@ -368,11 +368,12 @@ async def autogamble(
             if rounds % update_intervalls == 0:
                 actual_profit = sum(last_rounds)
                 last_rounds = []  # Reset für nächste Intervalle
-                await interaction.followup.send(
-                    f"Autogamble von **{interaction.user.display_name}**\n🎲 Runde {rounds}: "
-                    f"💰 Gewinn: {actual_profit:+} Münzen\n💰 Kontostand: {coins}",
-                    ephemeral=False
-                )
+                if rounds != max_retries:
+                    await interaction.followup.send(
+                        f"Autogamble von **{interaction.user.display_name}**\n🎲 Runde {rounds}: "
+                        f"💰 Gewinn: {actual_profit:+} Münzen\n💰 Kontostand: {coins}",
+                        ephemeral=False
+                    )
 
             await asyncio.sleep(0.8)
 
