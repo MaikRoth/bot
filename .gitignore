@@ -1,3 +1,5 @@
 venv/
 .env
 __pycache__/
+extract_commands.py
+commands_list.txt
