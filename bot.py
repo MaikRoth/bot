@@ -49,34 +49,6 @@ active_autogambles = {}
 db_lock = asyncio.Lock()
 
 
-async def create_dungeon_tables():
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS dungeons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                name TEXT NOT NULL,
-                rarity TEXT NOT NULL,
-                required_items TEXT NOT NULL,
-                reward_coins INTEGER DEFAULT 0,
-                reward_item TEXT DEFAULT NULL,
-                reward_xp INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_dungeons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                dungeon_id INTEGER NOT NULL,
-                completed INTEGER DEFAULT 0,
-                success INTEGER DEFAULT 0,
-                attempt_date TEXT DEFAULT (DATE('now','localtime')),
-                FOREIGN KEY(user_id) REFERENCES users(id),
-                FOREIGN KEY(dungeon_id) REFERENCES dungeons(id)
-            )
-        """)
-        await db.commit()
-
 async def dungeon_scheduler():
     while True:
         now = datetime.datetime.now()
@@ -139,7 +111,6 @@ async def on_ready():
 
     # 🏰 Dungeon-System starten
     try:
-        await create_dungeon_tables()          # Tabellen anlegen
         await generate_daily_dungeon()         # Dungeon für heute generieren
         bot.loop.create_task(dungeon_scheduler())  # Scheduler starten
         print("🏰 Dungeon-System gestartet und täglicher Generator aktiv.")
@@ -172,13 +143,20 @@ async def check_achievements(discord_id: int, db: aiosqlite.Connection, *, coins
     Nutzt users.id (user_db_id) überall dort, wo Fremdschlüssel referenzieren.
     Gibt eine Liste neu freigeschalteter Achievements zurück: [{id,name,reward_coins}, ...]
     """
+    await db.execute("PRAGMA foreign_keys = ON;")
+
     newly: List[Dict[str, Any]] = []
 
     # Row-Access per Namen
     db.row_factory = aiosqlite.Row
 
     # -- Starte eine IMMEDIATE-Transaktion (Race-Conditions vermeiden)
-    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        manual_transaction = True
+    except Exception:
+        # Falls bereits eine Transaktion aktiv ist
+        manual_transaction = False
 
     try:
         # 1) User laden
@@ -222,7 +200,7 @@ async def check_achievements(discord_id: int, db: aiosqlite.Connection, *, coins
             SELECT 
                 COALESCE(SUM(quantity),0)             AS total_items,
                 COALESCE(COUNT(DISTINCT LOWER(item_name)),0) AS distinct_items
-            FROM inventory
+            FROM inventory_new
             WHERE user_id = ? AND quantity > 0
         """, (user_db_id,)) as c:
             inv = await c.fetchone()
@@ -231,7 +209,7 @@ async def check_achievements(discord_id: int, db: aiosqlite.Connection, *, coins
 
         async with db.execute("""
             SELECT COALESCE(COUNT(*),0) AS cnt
-            FROM inventory
+            FROM inventory_new
             WHERE user_id = ? AND item_rarity = 'legendary' AND quantity > 0
         """, (user_db_id,)) as c:
             leg = await c.fetchone()
@@ -369,11 +347,13 @@ async def check_achievements(discord_id: int, db: aiosqlite.Connection, *, coins
         if total_reward > 0:
             await db.execute("UPDATE users SET coins = coins + ? WHERE id = ?", (total_reward, user_db_id))
 
-        await db.commit()
+        if manual_transaction:
+            await db.commit()
         return newly
 
     except Exception:
-        await db.execute("ROLLBACK")
+        if manual_transaction:
+            await db.execute("ROLLBACK")
         raise
 
 
@@ -446,22 +426,51 @@ async def dungeon_info(interaction: discord.Interaction):
     async with aiosqlite.connect(DATABASE) as db:
         db.row_factory = aiosqlite.Row
         today = (await (await db.execute("SELECT DATE('now','localtime')")).fetchone())[0]
+        
         async with db.execute("SELECT * FROM dungeons WHERE date = ?", (today,)) as cur:
             dungeon = await cur.fetchone()
 
-    if not dungeon:
-        await interaction.response.send_message("Heute gibt es noch keinen Dungeon.", ephemeral=True)
-        return
+        if not dungeon:
+            await interaction.response.send_message("Heute gibt es noch keinen Dungeon.", ephemeral=True)
+            return
+
+        # Inventar laden
+        async with db.execute(
+            "SELECT item_name, quantity, item_rarity FROM inventory_new WHERE user_id = ?",
+            (interaction.user.id,)
+        ) as cur:
+            inv = await cur.fetchall()
+
+    # ——— außerhalb der Datenbank weiterrechnen ———
+    inv_names = [i["item_name"] for i in inv]
+    required_items = [i.strip() for i in dungeon["required_items"].split(",")]
+
+    matched = sum(1 for i in required_items if i in inv_names)
+    base_chance = 0.3 + 0.15 * matched  # bis zu 100% bei allen Items
+    rarity_factor = {
+        "common": 1.0,
+        "uncommon": 0.9,
+        "rare": 0.8,
+        "epic": 0.7,
+        "legendary": 0.6
+    }[dungeon["rarity"]]
+    total_chance = min(base_chance * rarity_factor, 1.0)
 
     embed = discord.Embed(
         title=f"🏰 {dungeon['name']} ({dungeon['rarity'].capitalize()})",
-        description=f"**Benötigte Items:** {dungeon['required_items']}\n"
-                    f"**Belohnung:** {dungeon['reward_coins']} 💰",
+        description=(
+            f"**Benötigte Items:** {dungeon['required_items']}\n"
+            f"**Dein Erfolg:** {total_chance * 100:.2f}%\n"
+            f"**Belohnung:** {dungeon['reward_coins']} 💰"
+        ),
         color=discord.Color.gold()
     )
+
     if dungeon["reward_item"]:
-        embed.add_field(name="🎁 Seltener Drop", value=dungeon["reward_item"])
+        embed.add_field(name="🎁 Seltener Drop", value=dungeon["reward_item"], inline=False)
+
     await interaction.response.send_message(embed=embed)
+
 
 async def dungeon_scheduler():
     while True:
@@ -490,18 +499,9 @@ async def dungeon(interaction: discord.Interaction):
             await interaction.followup.send("🕸️ Heute gibt es keinen Dungeon.", ephemeral=True)
             return
 
-        # User-ID holen
-        async with db.execute("SELECT id FROM users WHERE discord_id = ?", (user_id,)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            await interaction.followup.send("❌ Du hast noch kein Profil. Nutze `/daily`, um anzufangen.", ephemeral=True)
-            return
-
-        user_db_id = row["id"]
-
         # prüfen, ob schon versucht
         async with db.execute(
-            "SELECT id FROM user_dungeons WHERE user_id = ? AND dungeon_id = ?", (user_db_id, dungeon["id"])
+            "SELECT id FROM user_dungeons WHERE user_id = ? AND dungeon_id = ?", (interaction.user.id, dungeon["id"])
         ) as cur:
             done = await cur.fetchone()
         if done:
@@ -511,7 +511,7 @@ async def dungeon(interaction: discord.Interaction):
         # Inventar prüfen
         required_items = [i.strip() for i in dungeon["required_items"].split(",")]
         async with db.execute(
-            "SELECT item_name, quantity, item_rarity FROM inventory WHERE user_id = ?", (user_db_id,)
+            "SELECT item_name, quantity, item_rarity FROM WHERE user_id = ?", (interaction.user.id,)
         ) as cur:
             inv = await cur.fetchall()
         inv_names = [i["item_name"] for i in inv]
@@ -524,25 +524,25 @@ async def dungeon(interaction: discord.Interaction):
 
         # Items zerstören
         for item in required_items:
-            await db.execute("DELETE FROM inventory WHERE user_id = ? AND item_name = ?", (user_db_id, item))
+            await db.execute("DELETE FROM inventory_new WHERE user_id = ? AND item_name = ?", (interaction.user.id, item))
 
         # Erfolg oder Misserfolg speichern
         await db.execute("""
             INSERT INTO user_dungeons (user_id, dungeon_id, completed, success)
             VALUES (?, ?, 1, ?)
-        """, (user_db_id, dungeon["id"], int(success)))
+        """, (interaction.user.id, dungeon["id"], int(success)))
 
         msg = f"🏰 **{dungeon['name']} ({dungeon['rarity'].capitalize()})**\n"
 
         if success:
             msg += "🎉 Du hast den Dungeon erfolgreich abgeschlossen!\n"
             msg += f"💰 **Belohnung:** {dungeon['reward_coins']} Münzen"
-            await db.execute("UPDATE users SET coins = coins + ? WHERE id = ?", (dungeon["reward_coins"], user_db_id))
+            await db.execute("UPDATE users_new SET coins = coins + ? WHERE discord_id = ?", (dungeon["reward_coins"], interaction.user.id))
             if dungeon["reward_item"]:
                 await db.execute("""
-                    INSERT INTO inventory (user_id, item_name, quantity, item_rarity)
+                    INSERT INTO inventory_new (user_id, item_name, quantity, item_rarity)
                     VALUES (?, ?, 1, ?)
-                """, (user_db_id, dungeon["reward_item"], dungeon["rarity"]))
+                """, (interaction.user.id, dungeon["reward_item"], dungeon["rarity"]))
                 msg += f"\n🎁 Zusätzlich erhalten: **{dungeon['reward_item']}**"
         else:
             msg += "😢 Du bist gescheitert und hast alle eingesetzten Items verloren."
@@ -558,44 +558,15 @@ async def daily(interaction: discord.Interaction):
     today = date.today()
 
     async with aiosqlite.connect(DATABASE) as db:
-        # --- Tabellen sicherstellen ---
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id INTEGER UNIQUE,
-                coins INTEGER DEFAULT 0,
-                level INTEGER DEFAULT 1,
-                streak INTEGER DEFAULT 0,
-                last_daily TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS achievements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                condition TEXT NOT NULL,
-                reward_coins INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_achievements (
-                user_id INTEGER NOT NULL,
-                achievement_id INTEGER NOT NULL,
-                achieved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, achievement_id)
-            )
-        """)
-
         # --- Benutzer laden oder anlegen ---
-        async with db.execute("SELECT coins, streak, last_daily FROM users WHERE discord_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT coins, streak, last_daily FROM users_new WHERE discord_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
 
         if row is None:
             coins, streak, last_daily = 0, 0, None
             await db.execute(
-                "INSERT INTO users (discord_id, coins, streak, last_daily) VALUES (?, ?, ?, ?)",
-                (user_id, 0, 0, None),
+                "INSERT INTO users_new (discord_id, coins, streak, last_daily) VALUES (?, ?, ?, ?)",
+                (user_id, coins, streak, last_daily),
             )
         else:
             coins, streak, last_daily = row
@@ -616,7 +587,7 @@ async def daily(interaction: discord.Interaction):
 
         # Datenbank aktualisieren
         await db.execute(
-            "UPDATE users SET coins = ?, streak = ?, last_daily = ? WHERE discord_id = ?",
+            "UPDATE users_new SET coins = ?, streak = ?, last_daily = ? WHERE discord_id = ?",
             (coins, streak, str(today), user_id),
         )
 
@@ -638,10 +609,13 @@ async def daily(interaction: discord.Interaction):
 
     # --- Neue Achievements anzeigen ---
     if new_achs:
+        # Extrahiere nur die IDs aus den Dicts
+        ach_ids = [a["id"] for a in new_achs]
+
         async with aiosqlite.connect(DATABASE) as db:
-            async with db.execute(
-                f"SELECT name FROM achievements WHERE id IN ({','.join('?' * len(new_achs))})", new_achs
-            ) as cursor:
+            placeholders = ",".join("?" * len(ach_ids))
+            query = f"SELECT name FROM achievements WHERE id IN ({placeholders})"
+            async with db.execute(query, ach_ids) as cursor:
                 names = await cursor.fetchall()
 
         names = [n[0] for n in names]
@@ -649,14 +623,34 @@ async def daily(interaction: discord.Interaction):
         await interaction.followup.send(msg)
 
 
+async def user_exists(discord_id: int, db: aiosqlite.Connection) -> bool:
+    async with db.execute("SELECT 1 FROM users_new WHERE discord_id = ?", (discord_id,)) as cursor:
+        row = await cursor.fetchone()
+        return row is not None
+
+async def check_user_stats(discord_id: int, db: aiosqlite.Connection) -> int:
+    """
+    Stellt sicher, dass ein Eintrag in user_stats für den User existiert.
+    Gibt die user_db_id zurück.
+    """
+    async with db.execute("SELECT discord_id FROM users_new WHERE discord_id = ?", (discord_id,)) as cursor:
+        row = await cursor.fetchone()
+        if not row:
+            raise ValueError("User existiert nicht in users_new.")
+        user_db_id = row[0]
+
+    async with db.execute("SELECT 1 FROM user_stats WHERE user_id = ?", (user_db_id,)) as cursor:
+        exists = await cursor.fetchone()
+        if not exists:
+            await db.execute("INSERT INTO user_stats (user_id) VALUES (?)", (user_db_id,))
+
+    return user_db_id
 
 # --- Command: /gamble <amount> ---
 @bot.tree.command(name="gamble", description="Setze deine Münzen und versuche dein Glück!")
 @app_commands.describe(amount="Anzahl der Münzen, die du setzen möchtest")
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def gamble(interaction: discord.Interaction, amount: int):
-
-
     if amount <= 0:
         return await interaction.response.send_message("❌ Bitte setze einen positiven Betrag!", ephemeral=True)
 
@@ -664,9 +658,8 @@ async def gamble(interaction: discord.Interaction, amount: int):
 
     # Eine Verbindung für alles
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT coins, id FROM users WHERE discord_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT coins FROM users_new WHERE discord_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            user_db_id = row[1] if row else None
         if not row:
             return await interaction.response.send_message(
                 "⚠️ Du hast noch kein Profil. Nutze `/daily`, um anzufangen!", ephemeral=True
@@ -681,12 +674,7 @@ async def gamble(interaction: discord.Interaction, amount: int):
 
         # Zufallswurf (eine Zeile, kein unnötiger Overhead)
         roll = random.random()
-        await db.execute("""
-    INSERT INTO user_stats (user_id, gambles_played)
-    VALUES (?, 1)
-    ON CONFLICT(user_id) DO UPDATE SET gambles_played = gambles_played + 1
-""", (user_db_id,))
-        await check_achievements(interaction.user.id, db)
+        
         # Wahrscheinlichkeiten in Reihenfolge (logisch gruppiert)
         if roll <= JACKPOT:  # Jackpot: 1 in 100 million
             multiplier, label, emoji = 0, "💎💎 JACKPOT 💎💎", None
@@ -701,14 +689,6 @@ async def gamble(interaction: discord.Interaction, amount: int):
         else:
             multiplier, label, emoji = 0, "😢 Verloren!", None
 
-        # Statistiken aktualisieren
-        if multiplier > 0:
-            await db.execute("""
-    INSERT INTO user_stats (user_id, gambles_won)
-    VALUES (?, 1)
-    ON CONFLICT(user_id) DO UPDATE SET gambles_won = gambles_won + 1
-""", (user_db_id,))
-            await check_achievements(interaction.user.id, db)
         # Münzberechnung in einer Zeile
         winnings = amount * multiplier
         new_coins = max(0, coins - amount + winnings)
@@ -739,16 +719,10 @@ async def gamble(interaction: discord.Interaction, amount: int):
             )
             
             label = f"💎💎 JACKPOT!!! Du hast {winnings:,} Münzen gewonnen! 💎💎"
-            await db.execute("""
-    INSERT INTO user_stats (user_id, jackpots_won)
-    VALUES (?, 1)
-    ON CONFLICT(user_id) DO UPDATE SET jackpots_won = jackpots_won + 1
-""", (user_db_id,))
-            await check_achievements(interaction.user.id, db)
 
 
         # Direktes Update (schneller als neue Verbindung)
-        await db.execute("UPDATE users SET coins = ? WHERE discord_id = ?", (new_coins, user_id))
+        await db.execute("UPDATE users_new SET coins = ? WHERE discord_id = ?", (new_coins, user_id))
         await db.commit()
         await check_achievements(interaction.user.id, db)
     # Embed schnell rendern
@@ -829,7 +803,7 @@ async def run_autogamble(channel: discord.TextChannel, user_id: int, amount: int
     """Führt den eigentlichen Autogamble-Loop aus."""
     async with db_lock:
         async with aiosqlite.connect(DATABASE) as db:
-            async with db.execute("SELECT coins FROM users WHERE discord_id = ?", (user_id,)) as cursor:
+            async with db.execute("SELECT coins FROM users_new WHERE discord_id = ?", (user_id,)) as cursor:
                 row = await cursor.fetchone()
             if row is None:
                 await channel.send(f"<@{user_id}> Du hast noch kein Profil! Nutze `/daily`, um anzufangen.")
@@ -897,7 +871,7 @@ async def run_autogamble(channel: discord.TextChannel, user_id: int, amount: int
                         total_loss += amount
                         await db.execute("UPDATE jackpot SET total_coins = ? WHERE id = ?", (jackpot_total, jackpot_id))
 
-                    await db.execute("UPDATE users SET coins = ? WHERE discord_id = ?", (coins, user_id))
+                    await db.execute("UPDATE user_new SET coins = ? WHERE discord_id = ?", (coins, user_id))
                     await db.commit()
 
             await save_session(user_id, amount, update_interval, max_retries, rounds, 1)
@@ -977,7 +951,7 @@ async def profile(interaction: discord.Interaction):
 
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT coins, level, streak, last_daily FROM users WHERE discord_id = ?", (user_id,)
+            "SELECT coins, level, streak, last_daily FROM user_new WHERE discord_id = ?", (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
 
@@ -1076,14 +1050,21 @@ async def shop(interaction: discord.Interaction):
             ) as cur:
                 items = await cur.fetchall()
 
+            # coins von user abrufen
+            async with db.execute(
+                "SELECT coins FROM users_new WHERE discord_id = ?", (interaction.user.id,)
+            ) as cur:
+                user_row = await cur.fetchone()
+                user_coins = user_row["coins"] if user_row else 0
+
     if not items:
         await interaction.followup.send("🛒 Der Shop ist heute leer.", ephemeral=True)
         return
 
     # Embed bauen
     embed = discord.Embed(
-        title=f"🛒 Täglicher Shop – {today}",
-        description="Hier sind die heutigen Items! Kaufe sie mit `/buy <item>`",
+        title=f"🛒 Täglicher Shop – {today}.",
+        description=f"Hier sind die heutigen Items! Kaufe sie mit `/buy <item>`.\n*Du hast `{user_coins}` Münzen*",
         color=discord.Color.blurple()
     )
 
@@ -1104,29 +1085,24 @@ async def shop(interaction: discord.Interaction):
 # --- Command: /achievements ---
 @bot.tree.command(name="achievements", description="Zeige deine freigeschalteten Achievements an")
 async def achievements(interaction: discord.Interaction):
-    user_id = interaction.user.id
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT discord_id FROM users WHERE discord_id = ?", (user_id,)
+            "SELECT discord_id FROM users_new WHERE discord_id = ?", (interaction.user.id,)
         ) as cur:
             user = await cur.fetchone()
         if not user:
             await interaction.response.send_message("Du hast noch kein Profil. Nutze `/daily` zuerst.", ephemeral=True)
             return
 
-        user_db_id = user[0]
-        print( "USER:" )
-        print( user )
-        print( "USER DB ID:" )
-        print( user_db_id )
+        user_db_id = interaction.user.id
+
         async with db.execute(
             "SELECT a.name, a.description, ua.achieved_at FROM achievements a "
-            "JOIN user_achievements ua ON a.id = ua.achievement_id "
+            "JOIN user_achievements_new ua ON a.id = ua.achievement_id "
             "WHERE ua.user_id = ?", (user_db_id,)
         ) as cur:
             achievements = await cur.fetchall()
-            print( "ACHIEVEMENTS:" )
-            print( achievements )
+     
 
     if not achievements:
         await interaction.response.send_message("🏆 Du hast noch keine Achievements freigeschaltet.", ephemeral=True)
@@ -1161,18 +1137,76 @@ async def showachievements(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
+
+
+# --- Command: /use ---
+@bot.tree.command(name="use", description="Benutze ein Item aus deinem Inventar")
+@app_commands.describe(item_name="Name des Items, das du benutzen möchtest")
+async def use(interaction: discord.Interaction, item_name: str):
+    user_id = interaction.user.id
+    async with aiosqlite.connect(DATABASE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT discord_id FROM users_new WHERE discord_id = ?", (user_id,)) as cur:
+            user = await cur.fetchone()
+
+        if not user:
+            await interaction.response.send_message("❌ Du hast noch kein Profil. Nutze `/daily`, um anzufangen.", ephemeral=True)
+            return
+
+        # Item im Inventar prüfen
+        async with db.execute(
+            "SELECT quantity FROM inventory_new WHERE user_id = ? AND item_name = ?",
+            (user_id, item_name)
+        ) as cur:
+            item = await cur.fetchone()
+
+        if not item or item["quantity"] <= 0:
+            await interaction.response.send_message(f"❌ Du besitzt kein Item namens **{item_name}**.", ephemeral=True)
+            return
+
+        # Item-Effekt (Beispiel: Auto-Miner aktivieren)
+        if item_name.lower() == "auto-miner":
+            # Logik zum Aktivieren des Auto-Miners hier einfügen
+            await interaction.response.send_message("🤖 Du hast den Auto-Miner aktiviert! Er wird jetzt automatisch Ressourcen für dich abbauen.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⚠️ Das Item **{item_name}** kann nicht benutzt werden.", ephemeral=True)
+            return
+        
+        if item_name.lower() == "energydrink":
+            # Energie auffüllen
+            async with db.execute("SELECT energy, max_energy FROM users_new WHERE id = ?", (user_id,)) as cur:
+                user_stats = await cur.fetchone()
+            new_energy = min(user_stats["energy"] + 50, user_stats["max_energy"])
+            await db.execute(
+                "UPDATE users_new SET energy = ? WHERE id = ?",
+                (new_energy, user_id)
+            )
+            await interaction.followup.send(f"⚡ Deine Energie wurde um 50 aufgefüllt! Aktuelle Energie: `{new_energy}/{user_stats['max_energy']}`", ephemeral=True)
+        
+        # Item verbrauchen
+        new_quantity = item["quantity"] - 1
+        if new_quantity > 0:
+            await db.execute(
+                "UPDATE inventory_new SET quantity = ? WHERE user_id = ? AND item_name = ?",
+                (new_quantity, user_id, item_name)
+            )
+        else:
+            await db.execute(
+                "DELETE FROM inventory_new WHERE user_id = ? AND item_name = ?",
+                (user_id, item_name)
+            )
+
+        await db.commit()
+
 active_automines = {}
 
-
-# ==============================
-#   MINE COMMAND /mine
-# ==============================
+# --- Command: /mine ---
 @bot.tree.command(name="mine", description="Mine Ressourcen aus deiner Mine!")
 async def mine(interaction: discord.Interaction):
     user_id = interaction.user.id
     async with aiosqlite.connect(DATABASE) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE discord_id = ?", (user_id,)) as cur:
+        async with db.execute("SELECT * FROM users_new WHERE discord_id = ?", (user_id,)) as cur:
             user = await cur.fetchone()
 
         if not user:
@@ -1187,7 +1221,10 @@ async def mine(interaction: discord.Interaction):
 
         if last_refill != today:
             energy = max_energy
-            await db.execute("UPDATE users SET energy = ?, last_energy_refill = ? WHERE discord_id = ?", (energy, today, user_id))
+            await db.execute(
+                "UPDATE user_new SET energy = ?, last_energy_refill = ? WHERE discord_id = ?",
+                (energy, today, user_id)
+            )
 
         if energy < 10:
             await interaction.response.send_message("💤 Du hast keine Energie mehr! Warte bis morgen, um wieder zu minen.", ephemeral=True)
@@ -1210,20 +1247,58 @@ async def mine(interaction: discord.Interaction):
             max_energy += 5
             leveled_up = True
 
-        # Mining-Ertrag
+        # Mining-Ertrag (Coins)
         base = random.randint(50, 200)
         multiplier = 1 + (mining_level - 1) * 0.05
         mined_amount = int(base * multiplier)
-
         new_coins = user["coins"] + mined_amount
 
+        # 🎁 Item Drop Chance
+        # Drop-Pool (mit Gewichtung)
+        possible_drops = [
+            ("Fackel", "common", 0.10),
+            ("Goldbarren", "epic", 0.01),
+            ("Edelstein", "rare", 0.005),
+            ("Auto-Miner", "legendary", 0.000001),  # 1 zu 1 Million
+        ]
+
+        found_item = None
+        for name, rarity, chance in possible_drops:
+            if random.random() < chance:
+                found_item = (name, rarity)
+                break
+
+        # Item ins Inventar speichern
+        if found_item:
+            name, rarity = found_item
+            # prüfen, ob der User das Item schon hat
+            async with db.execute(
+                "SELECT quantity FROM inventory_new WHERE user_id = ? AND item_name = ?",
+                (user["discord_id"], name)
+            ) as cur:
+                row = await cur.fetchone()
+
+            if row:
+                await db.execute(
+                    "UPDATE inventory_new SET quantity = quantity + 1 WHERE user_id = ? AND item_name = ?",
+                    (user["discord_id"], name)
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO inventory_new (user_id, item_name, quantity, item_rarity) VALUES (?, ?, ?, ?)",
+                    (user["discord_id"], name, 1, rarity)
+                )
+
+        # User updaten
         await db.execute("""
-            UPDATE users 
+            UPDATE users_new 
             SET coins = ?, mining_xp = ?, mining_level = ?, energy = ?, max_energy = ? 
             WHERE discord_id = ?
         """, (new_coins, mining_xp, mining_level, energy, max_energy, user_id))
         await db.commit()
         await check_achievements(interaction.user.id, db)
+
+    # Nachricht zusammenbauen
     msg = (
         f"⛏️ Du hast **{mined_amount} Münzen** aus deiner Mine gewonnen!\n"
         f"⚡ Energie: `{energy}/{max_energy}`\n"
@@ -1234,7 +1309,19 @@ async def mine(interaction: discord.Interaction):
     if leveled_up:
         msg += "\n🎉 **Level Up!** Deine maximale Energie wurde erhöht!"
 
+    if found_item:
+        name, rarity = found_item
+        rarity_emojis = {
+            "common": "⚪",
+            "uncommon": "🟢",
+            "rare": "🔵",
+            "epic": "🟣",
+            "legendary": "🟡"
+        }
+        msg += f"\n🎁 Du hast beim Minen ein Item gefunden: **{name}** {rarity_emojis.get(rarity, '')}!"
+
     await interaction.response.send_message(msg)
+
 
 # ==============================
 #   AUTO-MINE COMMANDS
@@ -1251,8 +1338,8 @@ async def automine(interaction: discord.Interaction):
     async with aiosqlite.connect(DATABASE) as db:
         # Check auf Item-Besitz
         async with db.execute("""
-            SELECT quantity FROM inventory 
-            WHERE user_id = (SELECT id FROM users WHERE discord_id = ?) 
+            SELECT quantity FROM inventory_new 
+            WHERE user_id = ?
               AND item_name = 'Auto-Miner'
         """, (user_id,)) as cur:
             item_row = await cur.fetchone()
@@ -1281,14 +1368,14 @@ async def automine(interaction: discord.Interaction):
                 mined_amount = random.randint(50, 200)
                 async with db_lock:
                     async with aiosqlite.connect(DATABASE) as db:
-                        async with db.execute("SELECT id, coins FROM users WHERE discord_id = ?", (user_id,)) as cur:
+                        async with db.execute("SELECT discord_id, coins FROM users_new WHERE discord_id = ?", (user_id,)) as cur:
                             user_row = await cur.fetchone()
                         if not user_row:
                             continue
 
                         user_db_id, coins = user_row
                         coins += mined_amount
-                        await db.execute("UPDATE users SET coins = ? WHERE id = ?", (coins, user_db_id))
+                        await db.execute("UPDATE users_new SET coins = ? WHERE discord_id = ?", (coins, user_db_id))
                         await db.commit()
 
                 try:
@@ -1341,14 +1428,14 @@ async def automine_restart_task(channel: discord.TextChannel, user_id: int):
             mined_amount = random.randint(50, 200)
             async with db_lock:
                 async with aiosqlite.connect(DATABASE) as db:
-                    async with db.execute("SELECT id, coins FROM users WHERE discord_id = ?", (user_id,)) as cur:
+                    async with db.execute("SELECT discord_id, coins FROM users_new WHERE discord_id = ?", (user_id,)) as cur:
                         user_row = await cur.fetchone()
                     if not user_row:
                         continue
 
                     user_db_id, coins = user_row
                     coins += mined_amount
-                    await db.execute("UPDATE users SET coins = ? WHERE id = ?", (coins, user_db_id))
+                    await db.execute("UPDATE users_new SET coins = ? WHERE discord_id = ?", (coins, user_db_id))
                     await db.commit()
             await channel.send(f"⛏️ <@{user_id}>, dein Auto-Miner hat **{mined_amount} Münzen** gesammelt! 💰")
 
@@ -1397,7 +1484,7 @@ async def buy(interaction: discord.Interaction, item: str):
         item_id, price, rarity = item_row
 
         # Hole Userdaten
-        async with db.execute("SELECT id, coins FROM users WHERE discord_id = ?", (user_id,)) as cur:
+        async with db.execute("SELECT discord_id, coins FROM users_new WHERE discord_id = ?", (user_id,)) as cur:
             user_row = await cur.fetchone()
 
         if not user_row:
@@ -1415,11 +1502,11 @@ async def buy(interaction: discord.Interaction, item: str):
 
         # Münzen abziehen
         new_coins = coins - price
-        await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_coins, user_db_id))
+        await db.execute("UPDATE users_new SET coins = ? WHERE discord_id = ?", (new_coins, user_db_id))
 
         # Item ins Inventar packen
         async with db.execute(
-            "SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?",
+            "SELECT quantity FROM inventory_new WHERE user_id = ? AND item_name = ?",
             (user_db_id, item)
         ) as cur:
             inv_row = await cur.fetchone()
@@ -1427,12 +1514,12 @@ async def buy(interaction: discord.Interaction, item: str):
         if inv_row:
             new_quantity = inv_row[0] + 1
             await db.execute(
-                "UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?",
+                "UPDATE inventory_new SET quantity = ? WHERE user_id = ? AND item_name = ?",
                 (new_quantity, user_db_id, item)
             )
         else:
             await db.execute(
-                "INSERT INTO inventory (user_id, item_name, quantity, item_rarity) VALUES (?, ?, ?, ?)",
+                "INSERT INTO inventory_new (user_id, item_name, quantity, item_rarity) VALUES (?, ?, ?, ?)",
                 (user_db_id, item, 1, rarity)
             )
 
@@ -1458,7 +1545,7 @@ async def sell(interaction: discord.Interaction, item: str, quantity: int = 1):
 
     async with aiosqlite.connect(DATABASE) as db:
         # Hole Userdaten
-        async with db.execute("SELECT id FROM users WHERE discord_id = ?", (user_id,)) as cur:
+        async with db.execute("SELECT discord_id FROM users_new WHERE discord_id = ?", (user_id,)) as cur:
             user_row = await cur.fetchone()
 
         if not user_row:
@@ -1468,7 +1555,7 @@ async def sell(interaction: discord.Interaction, item: str, quantity: int = 1):
         user_db_id = user_row[0]
 
         # Hole Item aus Inventar
-        async with db.execute("SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?", (user_db_id, item)) as cur:
+        async with db.execute("SELECT quantity FROM inventory_new WHERE user_id = ? AND item_name = ?", (user_db_id, item)) as cur:
             inv_row = await cur.fetchone()
 
         if not inv_row or inv_row[0] < quantity:
@@ -1492,16 +1579,16 @@ async def sell(interaction: discord.Interaction, item: str, quantity: int = 1):
         # Update Inventar
         new_quantity = current_quantity - quantity
         if new_quantity > 0:
-            await db.execute("UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?", (new_quantity, user_db_id, item))
+            await db.execute("UPDATE inventory_new SET quantity = ? WHERE user_id = ? AND item_name = ?", (new_quantity, user_db_id, item))
         else:
-            await db.execute("DELETE FROM inventory WHERE user_id = ? AND item_name = ?", (user_db_id, item))
+            await db.execute("DELETE FROM inventory_new WHERE user_id = ? AND item_name = ?", (user_db_id, item))
 
         # Update Münzen
-        async with db.execute("SELECT coins FROM users WHERE id = ?", (user_db_id,)) as cur:
+        async with db.execute("SELECT coins FROM users_new WHERE discord_id = ?", (user_db_id,)) as cur:
             coins_row = await cur.fetchone()
             new_coins = coins_row[0] + total_earnings
 
-        await db.execute("UPDATE users SET coins = ? WHERE id = ?", (new_coins, user_db_id))   
+        await db.execute("UPDATE users_new SET coins = ? WHERE discord_id = ?", (new_coins, user_db_id))
         await db.commit()
     await interaction.response.send_message(f"✅ Du hast **{quantity}x {item}** für **{total_earnings} 💰** verkauft!")
 
@@ -1514,7 +1601,7 @@ async def inventory(interaction: discord.Interaction, user: discord.User | None 
 
     async with aiosqlite.connect(DATABASE) as db:
         # Nutzer-ID prüfen
-        async with db.execute("SELECT id, coins FROM users WHERE discord_id = ?", (target_id,)) as cur:
+        async with db.execute("SELECT coins FROM users_new WHERE discord_id = ?", (target_id,)) as cur:
             user_row = await cur.fetchone()
 
         if not user_row:
@@ -1522,11 +1609,11 @@ async def inventory(interaction: discord.Interaction, user: discord.User | None 
             await interaction.response.send_message(msg, ephemeral=True)
             return
 
-        user_db_id, coins = user_row
+        coins = user_row[0]
 
         # Inventar abrufen
         async with db.execute(
-            "SELECT item_name, quantity, item_rarity FROM inventory WHERE user_id = ?", (user_db_id,)
+            "SELECT item_name, quantity, item_rarity FROM inventory_new WHERE user_id = ?", (target_id,)
         ) as cur:
             items = await cur.fetchall()
 
@@ -1537,7 +1624,6 @@ async def inventory(interaction: discord.Interaction, user: discord.User | None 
                 item_prices[name] = price
 
     embed = discord.Embed(title=f"🎒 Inventar von {target.display_name}", color=discord.Color.purple())
-    embed.add_field(name="💰 Münzen", value=f"{coins} 💰", inline=False)
 
     # Wenn Inventar leer
     if not items:
@@ -1558,7 +1644,9 @@ async def inventory(interaction: discord.Interaction, user: discord.User | None 
             case "epic": return "```asciidoc\n.Epic\n```"
             case "legendary": return "```ml\nLegendary\n```"
             case _: return rarity
-
+    embed.add_field(name="💰 Münzen", value=f"{coins} 💰 ", inline=True)
+    embed.add_field(name="💎 Gegenstandswert", value=f"berechne...", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)  # Leerfeld für Layout
     # Einzel-Item-Infos + Gesamtwert
     total_value = 0
     for name, qty, rarity in items:
@@ -1571,8 +1659,8 @@ async def inventory(interaction: discord.Interaction, user: discord.User | None 
             value=f"Menge: `{qty}`\nWert pro Stück: `{price} 💰`\nGesamt: `{value} 💰`\n{rarity_block(rarity)}",
             inline=True
         )
-
-    embed.add_field(name="💎 Gesamtwert des Inventars", value=f"{total_value} 💰", inline=False)
+    # Gesamtwert aktualisieren
+    embed.set_field_at(1, name="💎 Gegenstandswert", value=f"{total_value} 💰", inline=True)
 
     await interaction.response.send_message(embed=embed)
 
@@ -1582,7 +1670,7 @@ async def inventory(interaction: discord.Interaction, user: discord.User | None 
 async def leaderboard(interaction: discord.Interaction):
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT discord_id, coins FROM users ORDER BY coins DESC LIMIT 10"
+            "SELECT discord_id, coins FROM users_new ORDER BY coins DESC LIMIT 10"
         ) as cur:
             top_players = await cur.fetchall()
 
@@ -1600,10 +1688,11 @@ async def leaderboard(interaction: discord.Interaction):
 
 async def change_status():
     statuses = [
-        "mit Discord.py 🎮",
-        "auf euren Befehlen 👀",
-        f"auf {len(bot.guilds)} Servern 🌍"
-    ]
+        "auto Gamble 🎲",
+        "den ultra Dungeon 🏰",
+        "Schere-Stein-Papier ✂️🪨📄",
+        ]
+    
     while True:
         for status in statuses:
             await bot.change_presence(activity=discord.Game(name=status))
@@ -1685,7 +1774,7 @@ async def rps(interaction: discord.Interaction, wahl: app_commands.Choice[str]):
     if ergebnis in ["gewonnen", "unentschieden"]:
         user_id = interaction.user.id
         async with aiosqlite.connect(DATABASE) as db:
-            async with db.execute("SELECT coins FROM users WHERE discord_id = ?", (user_id,)) as cursor:
+            async with db.execute("SELECT coins FROM users_new WHERE discord_id = ?", (user_id,)) as cursor:
                 row = await cursor.fetchone()
             if row:
                 coins = row[0]
@@ -1699,7 +1788,7 @@ async def rps(interaction: discord.Interaction, wahl: app_commands.Choice[str]):
                 if coins < 0:
                     coins = 0
                 
-                await db.execute("UPDATE users SET coins = ? WHERE discord_id = ?", (coins, user_id))
+                await db.execute("UPDATE users_new SET coins = ? WHERE discord_id = ?", (coins, user_id))
                 await db.commit()
 
 
@@ -1784,7 +1873,7 @@ async def trivia(interaction: discord.Interaction):
 
     async with aiosqlite.connect(DATABASE) as db:
         for user_id, antwort in antworten.items():
-            async with db.execute("SELECT coins FROM users WHERE discord_id = ?", (user_id,)) as cursor:
+            async with db.execute("SELECT coins FROM users_new WHERE discord_id = ?", (user_id,)) as cursor:
                 row = await cursor.fetchone()
 
             coins = row[0] if row else 0
@@ -1796,7 +1885,7 @@ async def trivia(interaction: discord.Interaction):
                 coins -= 5
                 falsches_user_set.append((user_id, coins))
 
-            await db.execute("INSERT OR REPLACE INTO users (discord_id, coins) VALUES (?, ?)", (user_id, coins))
+            await db.execute("INSERT OR REPLACE INTO users_new (discord_id, coins) VALUES (?, ?)", (user_id, coins))
         await db.commit()
 
     # Ergebnis-Embed
