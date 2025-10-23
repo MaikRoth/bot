@@ -6,6 +6,7 @@ import discord
 import asyncio
 import aiohttp
 import aiosqlite
+import youtube_dl
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from discord.ext import commands
@@ -50,6 +51,129 @@ active_autogambles = {}
 db_lock = asyncio.Lock()
 
 
+
+
+# 🎛 YouTubeDL und FFmpeg Einstellungen
+YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist': 'True', 'quiet': True}
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+# 🎵 Musik-Warteschlange
+music_queues = {}
+
+# ===========================
+#     HILFSFUNKTIONEN
+# ===========================
+async def play_next(interaction: discord.Interaction):
+    """Spielt das nächste Lied in der Warteschlange ab."""
+    guild_id = interaction.guild.id
+    if guild_id not in music_queues or not music_queues[guild_id]:
+        await asyncio.sleep(2)
+        vc = interaction.guild.voice_client
+        if vc:
+            await vc.disconnect()
+        return
+
+    vc = interaction.guild.voice_client
+    if not vc:
+        return
+
+    # Nächstes Lied aus der Queue holen
+    link, title = music_queues[guild_id].pop(0)
+    with youtube_dl.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(link, download=False)
+        url2 = info['url']
+
+    vc.play(discord.FFmpegPCMAudio(url2, **FFMPEG_OPTIONS), after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction), asyncio.get_event_loop()))
+    await interaction.followup.send(f"🎶 **Spiele jetzt:** {title}")
+
+# ===========================
+#     /play COMMAND
+# ===========================
+@bot.tree.command(name="play", description="Spielt ein Lied ab oder fügt es zur Warteschlange hinzu.")
+@app_commands.describe(link="Der YouTube/Soundcloud-Link zum Song")
+async def play(interaction: discord.Interaction, link: str):
+    voice_channel = getattr(interaction.user.voice, 'channel', None)
+    if not voice_channel:
+        await interaction.response.send_message("❌ Du musst in einem Sprachkanal sein, um Musik abzuspielen.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    guild_id = interaction.guild.id
+    if guild_id not in music_queues:
+        music_queues[guild_id] = []
+
+    # Voice-Connection herstellen
+    if interaction.guild.voice_client:
+        vc = interaction.guild.voice_client
+        if vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+    else:
+        vc = await voice_channel.connect()
+
+    # Song laden
+    with youtube_dl.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(link, download=False)
+        url2 = info['url']
+        title = info.get('title', 'Unbekannter Titel')
+
+    if not vc.is_playing():
+        vc.play(discord.FFmpegPCMAudio(url2, **FFMPEG_OPTIONS), after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction), asyncio.get_event_loop()))
+        await interaction.followup.send(f"🎶 **Spiele:** {title}")
+    else:
+        music_queues[guild_id].append((link, title))
+        await interaction.followup.send(f"➕ **Zur Warteschlange hinzugefügt:** {title}")
+
+# ===========================
+#     /queue COMMAND
+# ===========================
+@bot.tree.command(name="queue", description="Zeigt die aktuelle Warteschlange.")
+async def queue(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    queue = music_queues.get(guild_id, [])
+
+    if not queue:
+        await interaction.response.send_message("🎧 Die Warteschlange ist leer.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🎶 Aktuelle Warteschlange", color=discord.Color.blurple())
+    for i, (_, title) in enumerate(queue, start=1):
+        embed.add_field(name=f"{i}.", value=title, inline=False)
+    await interaction.response.send_message(embed=embed)
+
+# ===========================
+#     /skip COMMAND
+# ===========================
+@bot.tree.command(name="skip", description="Überspringt das aktuelle Lied.")
+async def skip(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_playing():
+        await interaction.response.send_message("❌ Es läuft derzeit keine Musik.", ephemeral=True)
+        return
+
+    vc.stop()
+    await interaction.response.send_message("⏭️ **Lied übersprungen.**")
+
+# ===========================
+#     /stop COMMAND
+# ===========================
+@bot.tree.command(name="stop", description="Stoppt die Musik und verlässt den Sprachkanal.")
+async def stop(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc:
+        await interaction.response.send_message("❌ Ich bin in keinem Sprachkanal.", ephemeral=True)
+        return
+
+    vc.stop()
+    await vc.disconnect()
+    guild_id = interaction.guild.id
+    music_queues[guild_id] = []
+    await interaction.response.send_message("🛑 **Musik gestoppt und Kanal verlassen.**")
+
+    
 async def dungeon_scheduler():
     while True:
         now = datetime.datetime.now()
